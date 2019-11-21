@@ -1,0 +1,271 @@
+---
+title: "Calculating Metabolic Rate from Raw Presens Datafiles"
+author: "Melissa Drown"
+date: "4/4/2019"
+output: html_document
+---
+
+```{r setup}
+library(ggplot2)
+library(data.table)
+library(dplyr)
+library(tidyverse)
+```
+
+The block below will set variables for the rest of the script. The values assigned to these variables are dependent on the water temperature and salinity of the run because oxygen availability changes in water dependent on these parameters. The values displayed are for 28°C and 15 ppt water. 
+
+```{r variables}
+# gamma = saturation of O2 in umol/L for a specific temperature and salinity
+gamma=244.1
+
+# chamber_vol = volume of one glass respirometer chamber in Liters
+chamber_vol=0.2983
+
+# end_time = time in %H:%M:%S that the run should stop at
+# end_time is used to define the data points we cut from the file before analysis because the lights were on in the room
+end_time = "06:30:00"
+
+# interval_mins = number of minutes in one replicate measurement period
+interval_mins = 6 
+
+# num_sensors = number of sensors used in the run, max value of 10
+num_sensors = 10
+
+# interval = total number of lines in one measurement interval including data points from all sensors
+interval=interval_mins*num_sensors*20 
+  
+```
+
+Read in a file from the run to be analyzed and a file from a blank run. 
+The blank run will be used to correct for variation in sensors and background respiration in a chamber specific fashion.  
+
+```{r files}
+# Read in the run file from that day including columns: 2) Time, 3) Channel, 6) Sensor_Name, 7) delta_t (change in time in minutes), 9) Value (oxygen value in umol/L)
+# the run file for the day
+data <- fread("runfile.csv", select=c(2,3,6,7,9)) 
+
+# ensure that the change in time is being read in as a numeric value.
+data$delta_t <- as.numeric(data$delta_t)
+
+# Define total number of complete measurement periods in the data.
+total_num_cycles <- floor(nrow(data)/interval)
+
+#Cut any extra data points off of the end of the file so that only complete measurement periods are kept. 
+data <- data[-c((total_num_cycles*interval)+1:nrow(data))]
+
+# Make a file with columns including information listed below. This data can be pulled from a master file or placed in a seperate file and read in here. 
+#For each fish: Chamber (number), Chamber position (a for even chambers, b for odd chambers), Fish ID, sex, population, Channel (same as chamber), length, mass, mass_kg, Date, Temp, Weekday and any other desired metadata
+fish <- read.csv("fishinfo.csv")
+
+# Read in the blank run file including columns: 2) Time, 3) Channel, 6) Sensor_Name, 7) delta_t (change in time in minutes), 9) Value (oxygen value in umol/L)
+blank <- fread("2019Aug09_WAM_blank_O2.csv",select=c(2,3,6,7,9))
+
+# Read in a file containing the average background respiration values per chamber.
+background <- read.csv("background_by_chamber.csv")
+
+# ensure that the change in time is being read in as a numeric value.
+blank$delta_t <- as.numeric(blank$delta_t)
+```
+
+Add a replicate number to each measurement cycles. Note, even chambers are measured first, odd chambers second. Therefore, odd numbered replicates are even numbered chambers, and even numbered replicates are odd numbered chambers. 
+
+```{r replicate}
+# Use mutate to generate a new column containing intervals 1:total number of intervals
+data <- data %>%
+  mutate(Replicate=rep(1:total_num_cycles, each=interval))
+
+```
+
+Now that we have the files we want to remove any data that was recorded while the lights were on in the room because this may alter the behavior of the fish. We are looking to calculate a value as close as possible to minimum metabolic rate, which should occur at night when the fish are at rest. 
+
+Use as.POSIXct and strptime to convert the Time column of the data file to a format that R recognizes as time of day.
+Then use the subset function to keep only data that was recorded before the specified end_time from the beginning of this script. This should keep all data from midnight until the end_time. 
+
+Within the subset function use Sys.Date() to print today's date and add it to the time of day so we are filtering within a single day to take only data after midnight. 
+
+head and tail will print the first and last 6 lines of the data file so we can check that the filter worked. 
+
+```{r time of day filter}
+# convert format of the Time column from a character to a time of day
+data$Time <- as.POSIXct(strptime(data$Time, format="%H:%M:%S"))
+
+# filter by time of day
+data <- subset(data, data$Time <= paste(Sys.Date(), end_time, sep=" "))
+head(data, n = 10L)
+tail(data, n = 10L)
+```
+
+This for loop will print one ggplot object for each Channel of the oxygen meter. The graph will show time in minutes on the x-axis and oxygen value in umol/L on the y-axis. Using coord_cartesian() we can zoom in on differnt parts of the x or y axis to check out the data. 
+
+```{r graph}
+for (i in sort(unique(data$Channel))){
+ print(ggplot(data=subset(data, data$Channel==i),aes(x=delta_t, y=Value)) + 
+    geom_point() + ggtitle(i)
+  + coord_cartesian(x=c(400,500)))
+}
+
+```
+
+By cutting at Time of day we might have taken only parts of the first and last slope in the remaining data. This will mess up the analysis because we won't have a full measurement period of data to look at for those slopes. 
+
+To solve this issue we will find the first complete replicate cycle and remove any data before it. Then, using floor we can determine how many complete intervals (num_cycles) are left in the data file and delete all data points that remain at the end. 
+
+```{r cuts}
+# Cutting the beginning of the file
+data <- subset(data, data$Replicate > (min(data$Replicate)))
+
+# Define number of cycles in the data
+cut_num_cycles <- floor(nrow(data)/interval)
+
+# Cutting the end of the file
+data <- head(data,n=interval*cut_num_cycles)
+
+```
+
+Use the same for loop as above to plot oxygen over time as a function of channel number.
+Be sure to look at the beginning and end of the file to ensure that the data was cut appropriately. 
+
+```{r graph_2}
+for (i in sort(unique(data$Channel))){
+ print(ggplot(data=subset(data, data$Channel==i),aes(x=delta_t, y=Value)) + 
+    geom_point() + ggtitle(i)
+  + coord_cartesian(x=c(400,500)))
+}
+```
+
+Now we have only data from when the lights were off in the room and we have no partial measurement periods. We still have data points that were recorded between slopes that show the transition between one chamber and another. These data points should NOT be included in the final slope calculation and need to be removed. 
+
+Define del1 and del2 as the number of points to be deleted at the start and end of each slope and define keep as the remainder of data points from the slope to be kept for analysis. 
+
+Use mutate to create a new column with the word "delete" or "keep" printed depending on the defined del1, del2, and keep variables. Finally, subset the data to include only data points that have been marked in the Measure_Type column to "keep. "
+
+```{r slope_sectioning}
+# Cut in between each replicate to delete junk data
+del1 = 0.15*(interval/num_sensors)
+del2 = 0.15*(interval/num_sensors)
+keep = (interval/num_sensors)-del1-del2
+
+data <- data %>% group_by(Sensor_Name, Replicate) %>%
+  mutate(Measure_Type=rep(c("delete", "keep", "delete"), times=c(del1, keep, del2)))
+
+data <- subset(data, data$Measure_Type=="keep")
+
+```
+
+Use the same for loop to view the start and end of the file to determine how the deletions worked. There should now be only clearly defined decreasing slopes with no curved ends and no straggling data points in between them. 
+
+```{r graph3}
+
+for (i in sort(unique(data$Channel))){
+ print(ggplot(data=subset(data, data$Channel==i),aes(x=delta_t, y=Value)) + 
+    geom_point() + ggtitle(i)
+ + coord_cartesian(x=c(400,500)))
+}
+
+```
+
+The data cutting is done!
+
+We still have a few more analysis steps though. The data we have is using different sensors to measure different individuals and there may be variation due to sensor and not individual that are being confounded.
+
+Use the blank file to calibrate the sensors based on the actual vs. detected oxygen level in the chamber as determined by the saturation constant of oxygen. 
+
+```{r blank_correction}
+# determine the highest oxygen values in the file (highest 99th percentile)
+max_blank <- blank %>% group_by(Channel) %>%
+  summarise(high_perc=quantile(Value, 0.99))
+
+# correct for variation in sensor
+data <- data %>%
+  full_join(max_blank, by="Channel") %>%
+  mutate(O2_corrected=Value*gamma/high_perc)
+```
+
+Use the corrected oxygen values to calculate the slope of each measurement period for each fish. 
+
+```{r slopes}
+# Calculate corrected and uncorrected slopes
+slopes <- data %>%
+  group_by(Channel, Replicate) %>%
+  do(fitSlope = abs(lm(O2_corrected ~ delta_t, data = .)$coefficients[2]),
+     r_squared = summary(lm(O2_corrected ~ delta_t, data = .))$r.squared)
+
+slopes$fitSlope <- as.numeric(slopes$fitSlope)
+slopes$r_squared <- as.numeric(slopes$r_squared)
+
+summary(slopes)
+```
+
+Use the calculated R2 values to filter out any slopes that have an R2 lower than 0.9 as they are poorly fitted. 
+
+```{r filter_slopes}
+slopes <- subset(slopes, slopes$r_squared >= 0.9)
+```
+
+Merge the slope data with the fish information. Make sure your fish file has columns that will match the slopes data frame that was generated above so that the merge will work. 
+This is also the step where Replicates are split to their appropriate chamber. 
+
+```{r fishmerge}
+
+slopes <- slopes %>% mutate(Chamber_pos=ifelse(Replicate %% 2 == 0, "a","b")) 
+slopes$Chamber_pos <- as.factor(slopes$Chamber_pos)
+
+MO2 <- full_join(fish, slopes, by=c("Channel", "Chamber_pos"))
+```
+
+Calculate metabolic rate with final units of mgO2/L/hr and then determine the minimum metabolic rate for each fish based on the lower 10th percentile value from a continuous distribution function of all replicate slopes. 
+
+```{r MO2}
+# Correct for background respiration
+data <- full_join(data, background)
+data <- data %>% group_by(Chamber) %>% 
+  mutate(fitSlope_background_corrected = fitSlope - slope_background_avg)
+
+# Calculate Metabolic Rate for each slope
+MO2 <- MO2 %>%
+  mutate(MO2_mg_hr=(fitSlope_background_corrected)*60*0.032*(chamber_vol-mass_kg),
+         MO2_mg_hr_kg=MO2_mg_hr/mass_kg)
+
+# Save the tenth percentile (lower tail) values from the continuous distribution function of all replicate slopes per fish
+MO2_flat <- MO2 %>% group_by(FishID) %>%
+  summarise(tenth_perc_MO2_mg_hr = mean(tenth_perc_MO2_mg_hr, na.rm=TRUE),
+  tenth_perc_MO2_mg_hr_kg = mean(tenth_perc_MO2_mg_hr_kg, na.rm=TRUE))
+ 
+# generate a data frame containing all metadata and one value of minimum metabolic rate per fish. 
+MO2_flat <- full_join(fish, MO2_flat, by=c("FishID"))
+```
+
+```{r graphs}
+# There are some general graphics that can help for a quick summary. (Non-essential code)
+MO2$Sensor_Name <- as.factor(MO2$Channel)
+MO2$Chamber <- as.factor(MO2$Chamber)
+
+ggplot(MO2, aes(FishID)) + 
+  geom_boxplot(aes(y = MO2_mg_hr, colour = "MO2_mg_hr")) + 
+  geom_boxplot(aes(y = tenth_perc_MO2_mg_hr, colour = "tenth_perc_MO2_mg_hr"))
+
+ggplot(MO2, aes(Chamber)) + 
+  geom_boxplot(aes(y = MO2_mg_hr, colour = "MO2_mg_hr")) + 
+  geom_boxplot(aes(y = tenth_perc_MO2_mg_hr, colour = "tenth_perc_MO2_mg_hr"))
+
+ggplot(MO2) + 
+  geom_density(aes(x = tenth_perc_MO2_mg_hr, colour = "tenth_perc_MO2_mg_hr"))
+
+```
+
+```{r save}
+# download the files as a .csv
+# flat file with one metabolic rate per individual
+write.csv(MO2_flat, "2019Aug9_WAM_analyzed_flat.csv")
+# including all replicates
+write.csv(MO2, "2019Aug9_WAM_analyzed.csv")
+```
+
+After processing all files the following code can be used to determine the body mass residuals for each individual fish.
+
+```{r masscor}
+wam_mass <- summary(lm(log10(data_fish$tenth_perc_MO2_mg_hr)~log10(data_fish$mass_kg)))
+
+data_fish$tenth_perc_MO2_mg_hr_mass_res <- wam_mass$residuals
+
+```
