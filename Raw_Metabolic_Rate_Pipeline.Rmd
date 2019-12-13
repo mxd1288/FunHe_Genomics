@@ -19,7 +19,7 @@ The block below will set variables for the rest of the script. The values assign
 gamma=244.1
 
 # chamber_vol = volume of one glass respirometer chamber in Liters
-chamber_vol=0.2983
+chamber_vol=0.375
 
 # end_time = time in %H:%M:%S that the run should stop at
 # end_time is used to define the data points we cut from the file before analysis because the lights were on in the room
